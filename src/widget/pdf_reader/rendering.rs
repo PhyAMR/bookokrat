@@ -1160,6 +1160,11 @@ pub(crate) fn execute_display_plan(
             log::error!("Failed to clear kitty graphics for popup: {e}");
         }
         pdf_reader.last_render.rect = Rect::default();
+        // DisplayBatch::Clear removed every image, the link preview included.
+        pdf_reader.link_preview_shown = false;
+        if let Some(preview) = pdf_reader.link_preview.as_mut() {
+            preview.sent_image = None;
+        }
         return;
     }
 
@@ -1363,12 +1368,217 @@ pub(crate) fn execute_display_plan(
     // This covers the PDF image so the modal has an opaque background, while
     // ratatui text (borders, title, content) renders on top via z-index layering.
     emit_modal_overlay(pdf_reader);
+    emit_link_preview(pdf_reader);
 
     // Silence unused warnings
     let _ = conversion_tx;
 }
 
 const MODAL_OVERLAY_IMAGE_ID: u32 = u32::MAX - 1;
+const LINK_PREVIEW_IMAGE_ID: u32 = u32::MAX - 2;
+/// Above page images and the modal backing (both `IMAGE_Z_INDEX`). The
+/// preview's area holds no text, so drawing above the text layer is safe.
+const LINK_PREVIEW_Z_INDEX: i32 = 0;
+
+/// Horizontal extent of the page's text, padded, so the preview shows the
+/// content column instead of the page margins.
+fn link_preview_x_range(data: &crate::pdf::PageData) -> (u32, u32) {
+    let width = data.img_data.width_px;
+    let (mut x0, mut x1) = (f32::MAX, 0f32);
+    for line in &data.line_bounds {
+        x0 = x0.min(line.x0);
+        x1 = x1.max(line.x1);
+    }
+    if x0 >= x1 {
+        return (0, width);
+    }
+    let pad = width as f32 * 0.03;
+    let x0 = (x0 - pad).max(0.0) as u32;
+    let x1 = ((x1 + pad) as u32).min(width);
+    if x1 <= x0 { (0, width) } else { (x0, x1) }
+}
+
+/// Words that open a float caption ("Figure 3: …", "Tabla 2.", "Fig. 4").
+const CAPTION_PREFIXES: &[&str] = &[
+    "figure",
+    "fig.",
+    "table",
+    "tab.",
+    "algorithm",
+    "listing",
+    "figura",
+    "tabla",
+    "tabella",
+    "abbildung",
+    "tabelle",
+    "cuadro",
+];
+
+/// If the text line at the destination is a float caption, its vertical
+/// centre (pixels). LaTeX puts figure/table link targets on the caption while
+/// the float body sits above it (figures) or below it (tables), so a caption
+/// is centred in the preview instead of starting it.
+fn link_preview_caption_center(data: &crate::pdf::PageData, dest_y: f32) -> Option<f32> {
+    let reach = data.img_data.height_px as f32 * 0.03;
+    let line = data
+        .line_bounds
+        .iter()
+        .filter(|l| l.y1 >= dest_y && l.y0 <= dest_y + reach)
+        .min_by(|a, b| a.y0.total_cmp(&b.y0))?;
+    let text: String = line.chars.iter().take(24).map(|c| c.c).collect();
+    let text = text.trim_start().to_lowercase();
+    let is_caption = CAPTION_PREFIXES.iter().any(|p| {
+        text.strip_prefix(p).is_some_and(|rest| {
+            rest.trim_start()
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit() || c.is_ascii_uppercase())
+        })
+    });
+    is_caption.then_some((line.y0 + line.y1) / 2.0)
+}
+
+/// Place the link destination preview inside the area reserved by
+/// `render_link_preview_modal`. The whole destination page is transmitted once
+/// (SHM when available) and cropped with a source rect, so scrolling the
+/// preview only re-places the image.
+fn emit_link_preview(pdf_reader: &mut PdfReaderState) {
+    use crate::pdf::kittyv2::{
+        DeleteCommand, DirectTransmit, DisplayCommand, Format, Image, ImageId, Quiet,
+        TransmitCommand, is_tmux_mode, tracker,
+    };
+    let mut stdout = std::io::stdout();
+    let tmux = is_tmux_mode();
+
+    let cell = pdf_reader.coord_info.map(|(_, font_size)| font_size);
+    let ready = pdf_reader.link_preview.as_ref().and_then(|p| {
+        let area = p.image_area.filter(|a| a.width > 0 && a.height > 0)?;
+        Some((p.page_data.clone()?, area, cell?))
+    });
+    let Some((data, area, (cell_w, cell_h))) = ready else {
+        if pdf_reader.link_preview_shown {
+            let _ = DeleteCommand::by_id(LINK_PREVIEW_IMAGE_ID)
+                .delete()
+                .quiet(Quiet::Silent)
+                .write_to(&mut stdout, tmux);
+            let _ = std::io::Write::flush(&mut stdout);
+            pdf_reader.link_preview_shown = false;
+            if let Some(preview) = pdf_reader.link_preview.as_mut() {
+                preview.sent_image = None;
+            }
+        }
+        return;
+    };
+    let Some(preview) = pdf_reader.link_preview.as_mut() else {
+        return;
+    };
+
+    // Source rect: the text column, as tall as the popup's aspect ratio allows,
+    // starting a little above the destination.
+    let img = &data.img_data;
+    let (x0, x1) = link_preview_x_range(&data);
+    let src_w = x1 - x0;
+    let dest_w = f32::from(area.width) * f32::from(cell_w);
+    let dest_h = f32::from(area.height) * f32::from(cell_h);
+    let src_h = ((src_w as f32 * dest_h / dest_w).round() as u32).clamp(1, img.height_px);
+    let dest_y = preview.y * data.scale_factor;
+    let base = match link_preview_caption_center(&data, dest_y) {
+        Some(center) => (center - src_h as f32 / 2.0) as i32,
+        None => dest_y as i32 - (src_h as f32 * 0.06) as i32,
+    };
+    let max_top = (img.height_px - src_h) as i32;
+    let top = (base + preview.scroll_px).clamp(0, max_top);
+    preview.scroll_px = top - base; // keep scrolling within the page
+    let (top, src_w, src_h) = (top as u32, src_w, src_h);
+
+    let cursor = if tmux {
+        let (pane_top, pane_left) = crate::pdf::kittyv2::pane_offset();
+        (
+            pane_top as u32 + u32::from(area.y) + 1,
+            pane_left as u32 + u32::from(area.x) + 1,
+        )
+    } else {
+        (u32::from(area.y) + 1, u32::from(area.x) + 1)
+    };
+
+    let identity = std::sync::Arc::as_ptr(&data) as usize;
+    if preview.sent_image == Some(identity) {
+        let _ = DisplayCommand::new(LINK_PREVIEW_IMAGE_ID)
+            .placement_id(LINK_PREVIEW_IMAGE_ID)
+            .quiet(Quiet::Silent)
+            .no_cursor_move(true)
+            .cursor_at(cursor.0, cursor.1)
+            .source_rect(x0, top, src_w, src_h)
+            .dest_cells(area.width, area.height)
+            .z_index(LINK_PREVIEW_Z_INDEX)
+            .write_to(&mut stdout, tmux);
+        let _ = std::io::Write::flush(&mut stdout);
+        return;
+    }
+
+    if pdf_reader.link_preview_shown {
+        let _ = DeleteCommand::by_id(LINK_PREVIEW_IMAGE_ID)
+            .delete()
+            .quiet(Quiet::Silent)
+            .write_to(&mut stdout, tmux);
+    }
+    let format = if img.channels == 4 {
+        Format::Rgba
+    } else {
+        Format::Rgb
+    };
+    let id = ImageId::new(std::num::NonZeroU32::new(LINK_PREVIEW_IMAGE_ID).expect("non-zero"));
+    let shm = preview.use_shm.then(|| {
+        let name = format!("/bookokrat_preview-{}-{}", std::process::id(), preview.page);
+        if img.channels == 4 {
+            Image::create_shm_from_rgba(&img.pixels, img.width_px, img.height_px, &name, id)
+        } else {
+            Image::create_shm_from_rgb(&img.pixels, img.width_px, img.height_px, &name, id)
+        }
+    });
+    let sent = match shm {
+        Some(Ok((mut image, _))) => {
+            let lease = match &mut image.transmission {
+                crate::pdf::kittyv2::Transmission::SharedMemory { shm } => shm.take(),
+                crate::pdf::kittyv2::Transmission::Direct { .. } => None,
+            };
+            lease.is_some_and(|lease| {
+                let ok = TransmitCommand::new(img.width_px, img.height_px)
+                    .format(format)
+                    .image_id(LINK_PREVIEW_IMAGE_ID)
+                    .placement_id(LINK_PREVIEW_IMAGE_ID)
+                    .quiet(Quiet::ErrorsOnly)
+                    .no_cursor_move(true)
+                    .cursor_at(cursor.0, cursor.1)
+                    .source_rect(x0, top, src_w, src_h)
+                    .dest_cells(area.width, area.height)
+                    .z_index(LINK_PREVIEW_Z_INDEX)
+                    .write_to(&mut stdout, lease.path(), tmux)
+                    .is_ok();
+                lease.handoff_to_tracker(preview.page as i64, &mut tracker().lock().unwrap());
+                ok
+            })
+        }
+        _ => false,
+    };
+    if !sent {
+        // No SHM (e.g. remote session): one-off direct transmission.
+        let _ = DirectTransmit::new(img.width_px, img.height_px)
+            .format(format)
+            .image_id(LINK_PREVIEW_IMAGE_ID)
+            .placement_id(LINK_PREVIEW_IMAGE_ID)
+            .quiet(Quiet::ErrorsOnly)
+            .no_cursor_move(true)
+            .cursor_at(cursor.0, cursor.1)
+            .source_rect(x0, top, src_w, src_h)
+            .dest_cells(area.width, area.height)
+            .z_index(LINK_PREVIEW_Z_INDEX)
+            .send(&mut stdout, &img.pixels, tmux);
+    }
+    let _ = std::io::Write::flush(&mut stdout);
+    preview.sent_image = Some(identity);
+    pdf_reader.link_preview_shown = true;
+}
 
 fn emit_modal_overlay(pdf_reader: &mut PdfReaderState) {
     if !pdf_reader.is_kitty {
@@ -3015,6 +3225,17 @@ impl PdfReaderState {
                 );
             }
 
+            if let Some(preview) = self.link_preview.as_mut() {
+                self.modal_overlay_rect = Self::render_link_preview_modal(
+                    preview,
+                    frame,
+                    inner_area,
+                    modal_fg,
+                    popup_border,
+                    modal_panel_bg,
+                    modal_panel_header_bg,
+                );
+            }
             if let Some(ref msg) = modal_msg {
                 self.modal_overlay_rect = Self::render_input_modal(
                     frame,
@@ -3284,6 +3505,17 @@ impl PdfReaderState {
                 );
             }
 
+            if let Some(preview) = self.link_preview.as_mut() {
+                self.modal_overlay_rect = Self::render_link_preview_modal(
+                    preview,
+                    frame,
+                    inner_area,
+                    modal_fg,
+                    popup_border,
+                    modal_panel_bg,
+                    modal_panel_header_bg,
+                );
+            }
             if let Some(ref msg) = modal_msg {
                 self.modal_overlay_rect = Self::render_input_modal(
                     frame,
@@ -3399,6 +3631,17 @@ impl PdfReaderState {
             log::debug!("No pages ready to render - showing loading");
             Self::render_loading_in(frame, img_area, &self.palette);
 
+            if let Some(preview) = self.link_preview.as_mut() {
+                self.modal_overlay_rect = Self::render_link_preview_modal(
+                    preview,
+                    frame,
+                    inner_area,
+                    modal_fg,
+                    popup_border,
+                    modal_panel_bg,
+                    modal_panel_header_bg,
+                );
+            }
             if let Some(ref msg) = modal_msg {
                 self.modal_overlay_rect = Self::render_input_modal(
                     frame,
@@ -3693,6 +3936,17 @@ impl PdfReaderState {
                 }
             }
 
+            if let Some(preview) = self.link_preview.as_mut() {
+                self.modal_overlay_rect = Self::render_link_preview_modal(
+                    preview,
+                    frame,
+                    inner_area,
+                    modal_fg,
+                    popup_border,
+                    modal_panel_bg,
+                    modal_panel_header_bg,
+                );
+            }
             if let Some(ref msg) = modal_msg {
                 self.modal_overlay_rect = Self::render_input_modal(
                     frame,
@@ -3900,6 +4154,71 @@ impl PdfReaderState {
                 .add_modifier(Modifier::BOLD),
         );
         frame.render_widget(loading_span, inner_space[0]);
+    }
+
+    /// Frame of the link destination preview. The image itself is placed by
+    /// `emit_link_preview` after the frame is drawn; this reserves its area.
+    fn render_link_preview_modal(
+        preview: &mut super::state::LinkPreview,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        fg_color: Color,
+        accent_color: Color,
+        panel_bg: Color,
+        header_bg: Color,
+    ) -> Option<(u16, u16, u16, u16)> {
+        let width = area.width.saturating_sub(4).min(110);
+        let height = (area.height * 2 / 5)
+            .clamp(8, 30)
+            .min(area.height.saturating_sub(2));
+        if width < 20 || height < 5 {
+            preview.popup_area = None;
+            preview.image_area = None;
+            return None;
+        }
+        // Below the clicked link, or above it when there is no room.
+        let below = preview.anchor_row.saturating_add(1);
+        let y = if below + height <= area.y + area.height {
+            below
+        } else {
+            preview.anchor_row.saturating_sub(height).max(area.y)
+        };
+        let modal_area = Rect {
+            x: area.x + (area.width - width) / 2,
+            y,
+            width,
+            height,
+        };
+
+        let pad = 1u16;
+        let backing_x = modal_area.x.saturating_sub(pad);
+        let backing_y = modal_area.y.saturating_sub(pad);
+        let backing_w = (modal_area.width + pad * 2).min(area.x + area.width - backing_x);
+        let backing_h = (modal_area.height + pad * 2).min(area.y + area.height - backing_y);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(accent_color))
+            .title(format!(" Page {} ", preview.page + 1))
+            .title_style(Style::default().fg(accent_color).bg(header_bg))
+            .title_bottom(
+                Line::from(" ⏎ go · j/k scroll · esc close ")
+                    .right_aligned()
+                    .style(Style::default().fg(accent_color).bg(header_bg)),
+            )
+            .style(Style::default().bg(panel_bg));
+        let inner = block.inner(modal_area);
+        frame.render_widget(Clear, modal_area);
+        let body = if preview.page_data.is_some() {
+            Paragraph::new("")
+        } else {
+            Paragraph::new("Rendering page…").style(Style::default().fg(fg_color))
+        };
+        frame.render_widget(body.block(block), modal_area);
+
+        preview.popup_area = Some(modal_area);
+        preview.image_area = Some(inner);
+        Some((backing_x, backing_y, backing_w, backing_h))
     }
 
     fn render_input_modal(

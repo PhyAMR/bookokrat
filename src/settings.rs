@@ -9,7 +9,7 @@ const SETTINGS_FILENAME: &str = "config.yaml";
 const LEGACY_SETTINGS_FILENAME: &str = ".bookokrat_settings.yaml";
 const APP_NAME: &str = "bookokrat";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct YamlTheme {
     pub scheme: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -871,6 +871,8 @@ const LOOKUP_COMMAND_TEMPLATE: &str = r#"# =====================================
 # Shell command to run when you press Space+l on selected text.
 # Use {} as a placeholder for the selected word. If no {} is present,
 # the selected text is appended as a shell-escaped argument.
+# {file} is the document's absolute path and {page} the 1-based page of the
+# selection (PDF only). Like {}, they are escaped for use inside '...'.
 #
 # lookup_display controls how output is shown:
 #   popup          - capture stdout and show in a scrollable popup (default)
@@ -886,6 +888,10 @@ const LOOKUP_COMMAND_TEMPLATE: &str = r#"# =====================================
 #
 # Example: online dictionary in browser
 #   lookup_command: "open 'https://www.merriam-webster.com/dictionary/{}'"
+#   lookup_display: fire_and_forget
+#
+# Example: append the selection as a quote to a note about the document
+#   lookup_command: "my-notes quote '{file}' {page} '{}'"
 #   lookup_display: fire_and_forget
 
 # ============================================================================
@@ -903,6 +909,41 @@ const LOOKUP_COMMAND_TEMPLATE: &str = r#"# =====================================
 
 // Theme bootstrap reads the process-global settings: themes are registered
 // once at startup, before any App (and its RuntimeSettings) exists.
+
+/// Modification time of the config file in use, if any.
+pub fn config_modified() -> Option<std::time::SystemTime> {
+    let path = find_existing_config()?;
+    fs::metadata(path).ok()?.modified().ok()
+}
+
+/// Re-read `theme` and `custom_themes` from the config file, keeping every
+/// other setting as it is in memory. Lets an external tool (e.g. a desktop
+/// theme hook) recolor a running instance by editing the file. Returns false
+/// when the file is missing or doesn't parse (the current theme stays).
+pub fn reload_theme_from_file() -> bool {
+    let Some(path) = find_existing_config() else {
+        return false;
+    };
+    let Ok(content) = fs::read_to_string(&path) else {
+        return false;
+    };
+    let file = match serde_yaml::from_str::<Settings>(&content) {
+        Ok(file) => file,
+        Err(e) => {
+            warn!("Theme reload: failed to parse {path:?}: {e}");
+            return false;
+        }
+    };
+    let current = SETTINGS.load();
+    if current.theme == file.theme && current.custom_themes == file.custom_themes {
+        return false;
+    }
+    let mut next = (*current).clone();
+    next.theme = file.theme;
+    next.custom_themes = file.custom_themes;
+    SETTINGS.replace_without_persisting(next);
+    true
+}
 
 pub fn get_theme_name() -> String {
     SETTINGS.load().theme.clone()

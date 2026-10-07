@@ -25,6 +25,10 @@ pub struct Cli {
     #[arg(long)]
     pub zen_mode: bool,
 
+    /// Reload the document whenever it changes on disk (PDF: same as <Space>w)
+    #[arg(long)]
+    pub watch: bool,
+
     /// Open the most recently read book across all libraries
     #[arg(long, short = 'c')]
     pub continue_reading: bool,

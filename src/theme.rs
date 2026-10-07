@@ -88,6 +88,10 @@ impl BuiltinTheme {
 // Global theme storage
 static CUSTOM_THEMES: LazyLock<RwLock<Vec<Theme>>> = LazyLock::new(|| RwLock::new(Vec::new()));
 static CURRENT_THEME_INDEX: AtomicUsize = AtomicUsize::new(0);
+/// Leaked custom palettes by custom-theme index (see `current_theme`); cleared
+/// when custom themes are reloaded so edited palettes take effect.
+static CUSTOM_PALETTE_CACHE: LazyLock<RwLock<Vec<&'static Base16Palette>>> =
+    LazyLock::new(|| RwLock::new(Vec::new()));
 
 /// Load custom themes from settings and apply saved theme selection
 pub fn load_custom_themes() {
@@ -112,6 +116,9 @@ pub fn load_custom_themes() {
 
     if let Ok(mut themes) = CUSTOM_THEMES.write() {
         *themes = custom_themes;
+    }
+    if let Ok(mut cache) = CUSTOM_PALETTE_CACHE.write() {
+        cache.clear();
     }
 
     // Apply saved theme from settings
@@ -260,9 +267,6 @@ pub fn current_theme() -> &'static Base16Palette {
         // For custom themes, we need to return a static reference
         // Since custom themes are loaded once and stored in CUSTOM_THEMES,
         // we leak the palette to get a static reference (it lives for program duration anyway)
-        static CUSTOM_PALETTE_CACHE: LazyLock<RwLock<Vec<&'static Base16Palette>>> =
-            LazyLock::new(|| RwLock::new(Vec::new()));
-
         let custom_index = index - builtin_count;
 
         // Check if we already have this palette cached

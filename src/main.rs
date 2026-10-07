@@ -413,6 +413,7 @@ fn main() -> Result<()> {
         runtime_settings,
     );
     app.set_zen_mode(args.zen_mode);
+    app.set_watch_on_open(args.watch);
     app.set_test_mode(args.test_mode);
     if !keybinding_load_errors.is_empty() {
         app.open_keybinding_errors_popup(keybinding_load_errors);

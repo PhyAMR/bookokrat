@@ -27,8 +27,8 @@ pub(crate) use rendering::{
     apply_render_responses, execute_display_plan, update_non_kitty_viewport,
 };
 pub use state::{
-    CommentEditMode, CommentInputState, FocusedPanel, InputAction, PdfReaderState, PopupWindow,
-    SEPARATOR_HEIGHT,
+    CommentEditMode, CommentInputState, FocusedPanel, InputAction, LinkPreview, PdfReaderState,
+    PopupWindow, SEPARATOR_HEIGHT,
 };
 pub use types::{
     DisplayBatch, ImageRequest, LastRender, PageJumpMode, PdfDisplayPlan, PdfDisplayRequest,

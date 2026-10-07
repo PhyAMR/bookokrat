@@ -60,6 +60,10 @@ impl InputResponse {
     }
 }
 
+/// Links whose text has at most this many letters/digits are treated as
+/// references and previewed on click; longer ones (contents entries) jump.
+const LINK_PREVIEW_MAX_LABEL: usize = 12;
+
 impl PdfReaderState {
     fn kitty_dual_scroll_page_slice(
         &self,
@@ -452,6 +456,8 @@ impl PdfReaderState {
             InputResponse::handled(self.handle_comment_input_key(key))
         } else if self.comment_nav_active {
             InputResponse::handled(self.handle_comment_nav_key(key))
+        } else if self.link_preview.is_some() {
+            InputResponse::handled(self.handle_link_preview_key(key))
         } else if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('o') | KeyCode::Char('i'))
         {
@@ -1296,6 +1302,10 @@ impl PdfReaderState {
     }
 
     fn handle_mouse_event(&mut self, mouse: MouseEvent) -> Option<InputAction> {
+        if self.link_preview.is_some() {
+            return self.handle_link_preview_mouse(mouse);
+        }
+
         // SyncTeX inverse search (jump to source)
         if Self::is_synctex_inverse_mouse_trigger(mouse) {
             return self.handle_synctex_inverse_click(mouse.column, mouse.row);
@@ -3296,6 +3306,21 @@ impl PdfReaderState {
                                 self.selection.clear();
                                 self.last_render.rect = Rect::default();
                             }
+                            // Short labels are references ("(2.1)", "Fig. 3",
+                            // "2.2.15") and get a preview; long ones are
+                            // contents/outline entries and jump straight there.
+                            let is_reference = self.link_at_point(&point).is_some_and(|link| {
+                                self.link_label(point.page, link)
+                                    .chars()
+                                    .filter(|c| c.is_alphanumeric())
+                                    .count()
+                                    <= LINK_PREVIEW_MAX_LABEL
+                            });
+                            if let crate::pdf::LinkTarget::InternalAt { page, y } = target {
+                                if self.is_kitty && is_reference && page < self.rendered.len() {
+                                    return Some(self.open_link_preview(page, y, row));
+                                }
+                            }
                             return Some(self.activate_link_target(target));
                         }
                     }
@@ -3951,6 +3976,31 @@ impl PdfReaderState {
         &self,
         point: &crate::pdf::SelectionPoint,
     ) -> Option<crate::pdf::LinkTarget> {
+        self.link_at_point(point).map(|link| link.target.clone())
+    }
+
+    /// Text covered by a link on `page` (its characters inside the box).
+    fn link_label(&self, page: usize, link: &crate::pdf::LinkRect) -> String {
+        let Some(rendered) = self.rendered.get(page) else {
+            return String::new();
+        };
+        let (x0, y0, x1, y1) = (
+            link.x0 as f32,
+            link.y0 as f32,
+            link.x1 as f32,
+            link.y1 as f32,
+        );
+        rendered
+            .line_bounds
+            .iter()
+            .filter(|line| line.y1 >= y0 && line.y0 <= y1)
+            .flat_map(|line| line.chars.iter())
+            .filter(|ch| ch.x >= x0 && ch.x <= x1)
+            .map(|ch| ch.c)
+            .collect()
+    }
+
+    fn link_at_point(&self, point: &crate::pdf::SelectionPoint) -> Option<&crate::pdf::LinkRect> {
         let rendered = self.rendered.get(point.page)?;
         let x = point.pdf_x;
         let y = point.pdf_y;
@@ -3971,7 +4021,7 @@ impl PdfReaderState {
                     0.0
                 };
                 if x >= bx0 && x <= bx1 && y + tol_y >= by0 && y - tol_y <= by1 {
-                    return Some(link.target.clone());
+                    return Some(link);
                 }
             }
         }
@@ -3992,9 +4042,78 @@ impl PdfReaderState {
         self.link_target_at_point(&point)
     }
 
+    fn open_link_preview(&mut self, page: usize, y: f32, anchor_row: u16) -> InputAction {
+        if self.normal_mode.active {
+            self.normal_mode.deactivate();
+        }
+        self.link_preview = Some(super::state::LinkPreview::new(page, y, anchor_row));
+        self.force_redraw();
+        InputAction::Redraw
+    }
+
+    pub(crate) fn close_link_preview(&mut self) -> Option<InputAction> {
+        self.link_preview.take()?;
+        self.last_render.rect = Rect::default();
+        Some(InputAction::Redraw)
+    }
+
+    /// Jump to the previewed destination (pushes the jump list like a click).
+    fn follow_link_preview(&mut self) -> Option<InputAction> {
+        let preview = self.link_preview.take()?;
+        self.last_render.rect = Rect::default();
+        Some(
+            self.activate_link_target(crate::pdf::LinkTarget::InternalAt {
+                page: preview.page,
+                y: preview.y,
+            }),
+        )
+    }
+
+    fn scroll_link_preview(&mut self, direction: i32) -> Option<InputAction> {
+        let preview = self.link_preview.as_mut()?;
+        // A tenth of the visible crop per step; the renderer clamps to the page.
+        let step = preview
+            .page_data
+            .as_ref()
+            .map_or(40, |d| (d.img_data.height_px / 40).max(8) as i32);
+        preview.scroll_px += direction * step;
+        self.force_redraw();
+        Some(InputAction::Redraw)
+    }
+
+    /// Keys while a link preview is open. Like the other in-reader modals
+    /// (go-to-page, comment navigation) the preview owns the keyboard.
+    fn handle_link_preview_key(&mut self, key: KeyEvent) -> Option<InputAction> {
+        match key.code {
+            KeyCode::Enter => self.follow_link_preview(),
+            KeyCode::Char('j') | KeyCode::Down => self.scroll_link_preview(1),
+            KeyCode::Char('k') | KeyCode::Up => self.scroll_link_preview(-1),
+            KeyCode::Esc | KeyCode::Char('q') => self.close_link_preview(),
+            _ => Some(InputAction::Redraw),
+        }
+    }
+
+    /// Mouse while a link preview is open: click inside follows the link,
+    /// click outside closes, the wheel scrolls the preview.
+    fn handle_link_preview_mouse(&mut self, mouse: MouseEvent) -> Option<InputAction> {
+        let inside = self
+            .link_preview
+            .as_ref()
+            .and_then(|p| p.popup_area)
+            .is_some_and(|a| a.contains(ratatui::layout::Position::new(mouse.column, mouse.row)));
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) if inside => self.follow_link_preview(),
+            MouseEventKind::Down(_) => self.close_link_preview(),
+            MouseEventKind::ScrollDown if inside => self.scroll_link_preview(1),
+            MouseEventKind::ScrollUp if inside => self.scroll_link_preview(-1),
+            _ => None,
+        }
+    }
+
     fn activate_link_target(&mut self, target: crate::pdf::LinkTarget) -> InputAction {
         match target {
-            crate::pdf::LinkTarget::Internal { page } => {
+            crate::pdf::LinkTarget::Internal { page }
+            | crate::pdf::LinkTarget::InternalAt { page, .. } => {
                 if page < self.rendered.len() {
                     if page != self.page {
                         let scroll_offset = self
@@ -7153,6 +7272,8 @@ pub(crate) fn apply_theme_to_pdf_reader(
         let (fr, fg, fb) = extract_pdf_rgb(&palette.base_05);
         let black = (br as i32) << 16 | (bg as i32) << 8 | bb as i32;
         let white = (fr as i32) << 16 | (fg as i32) << 8 | fb as i32;
+        let (ar, ag, ab) = extract_pdf_rgb(&palette.base_0d);
+        crate::pdf::set_title_color(u32::from(ar) << 16 | u32::from(ag) << 8 | u32::from(ab));
         (black, white)
     } else {
         (-1, -1)

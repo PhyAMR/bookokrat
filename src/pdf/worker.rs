@@ -27,7 +27,25 @@ pub(crate) fn is_djvu_path(path: &Path) -> bool {
     })
 }
 
-const TITLE_RGB: (u8, u8, u8) = (0x66, 0x99, 0xCC);
+/// Colour for detected headings, 0xRRGGBB. Defaults to the built-in theme's
+/// blue; `set_title_color` follows the active theme's accent (base0D).
+static TITLE_COLOR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x6699CC);
+
+/// Set the heading colour used by themed rendering (0xRRGGBB).
+pub fn set_title_color(rgb: u32) {
+    TITLE_COLOR.store(rgb & 0xFF_FFFF, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn title_rgb() -> (u8, u8, u8) {
+    let c = TITLE_COLOR.load(std::sync::atomic::Ordering::Relaxed);
+    ((c >> 16) as u8, (c >> 8) as u8, c as u8)
+}
+
+/// Rec. 601 luma of a 0xRRGGBB colour.
+fn rgb_luma(c: i32) -> u32 {
+    let (r, g, b) = ((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
+    (299 * r as u32 + 587 * g as u32 + 114 * b as u32) / 1000
+}
 const TITLE_LUMA_DARK_MAX: u8 = 90;
 const TITLE_LUMA_LIGHT_MIN: u8 = 180;
 const DJVU_INTERNAL_RENDER_SCALE: u32 = 1;
@@ -536,7 +554,11 @@ pub fn render_page(
     if themed_rendering {
         if let Ok(title_rects) = collect_title_rects(&page, spec.mag, page_bounds.0) {
             if !title_rects.is_empty() {
-                apply_title_color(&mut pixmap, &title_rects, true);
+                // `black` is the paper and `white` the ink (see tint above):
+                // on dark paper the glyphs are the light pixels, on light
+                // paper the dark ones.
+                let dark_paper = rgb_luma(params.black) < rgb_luma(params.white);
+                apply_title_color(&mut pixmap, &title_rects, dark_paper);
             }
         }
     }
@@ -929,6 +951,22 @@ fn estimate_char_width(line: &LineBounds) -> f32 {
     (line.x1 - line.x0) / line.chars.len() as f32
 }
 
+/// Top edge (PDF points, y down) named by a link destination, if any.
+/// `Fit`-style destinations only name a page.
+fn link_dest_top(kind: &mupdf::destination::DestinationKind) -> Option<f32> {
+    use mupdf::destination::DestinationKind;
+    let top = match *kind {
+        DestinationKind::XYZ { top, .. } => top?,
+        DestinationKind::FitH { top } | DestinationKind::FitBH { top } => top,
+        DestinationKind::FitR { top, bottom, .. } => top.min(bottom),
+        DestinationKind::Fit
+        | DestinationKind::FitB
+        | DestinationKind::FitV { .. }
+        | DestinationKind::FitBV { .. } => return None,
+    };
+    top.is_finite().then_some(top)
+}
+
 pub(crate) fn extract_link_rects(page: &Page, scale_factor: f32) -> Vec<LinkRect> {
     let Ok(links) = page.links() else {
         return Vec::new();
@@ -937,8 +975,13 @@ pub(crate) fn extract_link_rects(page: &Page, scale_factor: f32) -> Vec<LinkRect
     links
         .filter_map(|link| {
             let target = if let Some(dest) = link.dest {
-                Some(LinkTarget::Internal {
-                    page: dest.loc.page_number as usize,
+                let page = dest.loc.page_number as usize;
+                Some(match link_dest_top(&dest.kind) {
+                    Some(top) => LinkTarget::InternalAt {
+                        page,
+                        y: top.max(0.0),
+                    },
+                    None => LinkTarget::Internal { page },
                 })
             } else if !link.uri.is_empty() {
                 Some(LinkTarget::External {
@@ -1060,6 +1103,12 @@ fn title_rects_for_threshold(
     lines
         .iter()
         .filter(|line| {
+            // A horizontal line's box is about one font size tall; rotated
+            // text (e.g. a diagonal watermark) spans much of the page and
+            // would recolour everything under its box.
+            if line.height > line.max_size * 2.5 {
+                return false;
+            }
             let line_width = (line.bbox.x1 - line.bbox.x0).abs();
             let height_ok = line.height >= median_height * 1.1;
             let width_ok = line_width <= page_width * 0.7;
@@ -1093,6 +1142,7 @@ fn percentile(values: &[f32], pct: f32) -> Option<f32> {
 }
 
 fn apply_title_color(pixmap: &mut Pixmap, rects: &[TitleRect], inverted: bool) {
+    let title = title_rgb();
     let n = pixmap.n() as usize;
     if n < 3 {
         return;
@@ -1139,9 +1189,9 @@ fn apply_title_color(pixmap: &mut Pixmap, rects: &[TitleRect], inverted: bool) {
                 let row = &mut samples[start..end];
 
                 match n {
-                    3 => simd_luma::apply_title_rgb(row, TITLE_RGB, threshold, inverted),
-                    4 => simd_luma::apply_title_rgba(row, TITLE_RGB, threshold, inverted),
-                    _ => apply_title_row_scalar(row, n, TITLE_RGB, threshold, inverted),
+                    3 => simd_luma::apply_title_rgb(row, title, threshold, inverted),
+                    4 => simd_luma::apply_title_rgba(row, title, threshold, inverted),
+                    _ => apply_title_row_scalar(row, n, title, threshold, inverted),
                 }
             }
         }
@@ -1161,9 +1211,9 @@ fn apply_title_color(pixmap: &mut Pixmap, rects: &[TitleRect], inverted: bool) {
                 let row = &mut row[start..end];
 
                 match n {
-                    3 => simd_luma::apply_title_rgb(row, TITLE_RGB, threshold, inverted),
-                    4 => simd_luma::apply_title_rgba(row, TITLE_RGB, threshold, inverted),
-                    _ => apply_title_row_scalar(row, n, TITLE_RGB, threshold, inverted),
+                    3 => simd_luma::apply_title_rgb(row, title, threshold, inverted),
+                    4 => simd_luma::apply_title_rgba(row, title, threshold, inverted),
+                    _ => apply_title_row_scalar(row, n, title, threshold, inverted),
                 }
             }
         });

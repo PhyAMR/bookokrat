@@ -590,7 +590,8 @@ fn extract_toc_entries_from_page_with_diagnostics(
 
                 let target = if let Some(link) = link_for_line(line, &link_rects) {
                     match &link.target {
-                        super::super::types::LinkTarget::Internal { page } => {
+                        super::super::types::LinkTarget::Internal { page }
+                        | super::super::types::LinkTarget::InternalAt { page, .. } => {
                             TocTarget::InternalPage(*page)
                         }
                         super::super::types::LinkTarget::External { uri } => {
@@ -1123,7 +1124,8 @@ fn extract_toc_entries_from_page(page: &mupdf::Page) -> Vec<TocEntry> {
 
                 let target = if let Some(link) = link_for_line(line, &link_rects) {
                     match &link.target {
-                        super::super::types::LinkTarget::Internal { page } => {
+                        super::super::types::LinkTarget::Internal { page }
+                        | super::super::types::LinkTarget::InternalAt { page, .. } => {
                             TocTarget::InternalPage(*page)
                         }
                         super::super::types::LinkTarget::External { uri } => {

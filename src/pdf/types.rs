@@ -29,8 +29,18 @@ pub struct LineBounds {
 /// Link target type
 #[derive(Clone, Debug)]
 pub enum LinkTarget {
-    Internal { page: usize },
-    External { uri: String },
+    Internal {
+        page: usize,
+    },
+    /// Internal link whose destination names a vertical position: `y` is the
+    /// destination's top edge in PDF points (y down), independent of zoom.
+    InternalAt {
+        page: usize,
+        y: f32,
+    },
+    External {
+        uri: String,
+    },
 }
 
 /// Link rectangle in pixel coordinates

@@ -308,6 +308,49 @@ pub(crate) struct KittyScrollAnchor {
     pub source_y_ratio: f64,
 }
 
+/// Floating preview of an internal link's destination (equation, figure,
+/// table…), opened by clicking a link whose destination names a position on
+/// its page. The destination page is shown cropped around that position.
+#[derive(Debug)]
+pub struct LinkPreview {
+    /// Destination page (0-indexed)
+    pub page: usize,
+    /// Destination top edge in PDF points (y down)
+    pub y: f32,
+    /// Terminal row of the clicked link; the popup opens below it, or above
+    /// when there is no room
+    pub anchor_row: u16,
+    /// Scroll inside the preview, in destination-page pixels
+    pub scroll_px: i32,
+    /// Rendered destination page, once the render service has it
+    pub page_data: Option<Arc<crate::pdf::PageData>>,
+    /// Use SHM for the preview image (falls back to direct transmission)
+    pub use_shm: bool,
+    /// Popup rect and image area from the last render (mouse hit testing,
+    /// image placement)
+    pub popup_area: Option<Rect>,
+    pub image_area: Option<Rect>,
+    /// Identity of the page data last transmitted to the terminal
+    pub sent_image: Option<usize>,
+}
+
+impl LinkPreview {
+    #[must_use]
+    pub fn new(page: usize, y: f32, anchor_row: u16) -> Self {
+        Self {
+            page,
+            y,
+            anchor_row,
+            scroll_px: 0,
+            page_data: None,
+            use_shm: true,
+            popup_area: None,
+            image_area: None,
+            sent_image: None,
+        }
+    }
+}
+
 /// Main PDF reader widget state
 pub struct PdfReaderState {
     pub(crate) settings: RuntimeSettings,
@@ -398,6 +441,11 @@ pub struct PdfReaderState {
     /// Last overlay rect that was actually transmitted to Kitty, used to avoid
     /// redundant delete+retransmit cycles that cause blinking.
     pub modal_overlay_sent: Option<(u16, u16, u16, u16)>,
+    /// Open link destination preview, if any
+    pub link_preview: Option<LinkPreview>,
+    /// Whether a link preview image is placed in the terminal (so it can be
+    /// deleted after the preview closes)
+    pub link_preview_shown: bool,
     /// Comment selection rectangles for overlay rendering
     pub comment_rects: Vec<SelectionRect>,
     /// Highlight rectangles for overlay rendering
@@ -522,6 +570,8 @@ impl PdfReaderState {
             pending_screen_refresh: false,
             uses_iterm2_protocol: false,
             modal_overlay_sent: None,
+            link_preview: None,
+            link_preview_shown: false,
             comment_rects: Vec::new(),
             highlight_overlays: Vec::new(),
             comment_nav_active: false,

@@ -276,11 +276,19 @@ pub struct App {
     notifications: NotificationManager,
     help_bar_area: Rect,
     zen_mode: bool,
+    watch_on_open: bool,
+    /// --watch for EPUB/HTML: (path, mtime) last seen, polled about once a second
+    book_watch: Option<(String, std::time::SystemTime)>,
+    book_watch_checked_at: Instant,
     test_mode: bool,
     nav_panel_width_override: Option<u16>,
     resizing_nav_panel: bool,
     current_context_override: Option<LibraryContext>,
     pub pending_force_redraw: bool,
+    /// Config file mtime last seen, and when it was last checked: an edited
+    /// theme (e.g. from a desktop theme hook) is applied live.
+    config_modified: Option<std::time::SystemTime>,
+    config_checked_at: Instant,
     /// One-shot terminal.clear() without touching images. Used on the
     /// non-kitty PDF path when a freshly converted page image arrives while a
     /// modal is open: the re-emitted image escape paints over the modal's
@@ -750,11 +758,16 @@ impl App {
             notifications: NotificationManager::new(),
             help_bar_area: Rect::default(),
             zen_mode: false,
+            watch_on_open: false,
+            book_watch: None,
+            book_watch_checked_at: Instant::now(),
             test_mode: false,
             nav_panel_width_override: initial_settings.nav_panel_width,
             resizing_nav_panel: false,
             current_context_override: None,
             pending_force_redraw: false,
+            config_modified: crate::settings::config_modified(),
+            config_checked_at: Instant::now(),
             pending_screen_refresh: false,
             #[cfg(unix)]
             pending_suspend: false,
@@ -845,6 +858,30 @@ impl App {
         app
     }
 
+    /// Document path and 1-based page (PDF selection start, else the current
+    /// page) for the lookup command's `{file}`/`{page}` placeholders.
+    fn lookup_location(&self) -> (String, Option<usize>) {
+        let file = self
+            .current_book_path_for_marks()
+            .map(|p| {
+                std::fs::canonicalize(&p)
+                    .map(|c| c.to_string_lossy().into_owned())
+                    .unwrap_or(p)
+            })
+            .unwrap_or_default();
+        #[cfg(feature = "pdf")]
+        if self.is_pdf_mode() {
+            if let Some(reader) = self.pdf_reader.as_ref() {
+                let page = reader
+                    .selection
+                    .get_ordered_bounds()
+                    .map_or(reader.page, |(start, _)| start.page);
+                return (file, Some(page + 1));
+            }
+        }
+        (file, None)
+    }
+
     fn execute_lookup_command(&mut self, selected_text: &str) {
         let Some(command_template) = self.settings.load().lookup_command.clone() else {
             self.show_info(
@@ -861,6 +898,13 @@ impl App {
 
         // Shell-escape the selected text with single quotes
         let escaped = trimmed.replace('\'', "'\\''");
+        // `{file}` (absolute document path) and `{page}` (1-based page of the
+        // selection, PDF only) let the command know where the text came from,
+        // e.g. to append a quote to a note about this document.
+        let (file, page) = self.lookup_location();
+        let command_template = command_template
+            .replace("{file}", &file.replace('\'', "'\\''"))
+            .replace("{page}", &page.map(|p| p.to_string()).unwrap_or_default());
         let command = if command_template.contains("{}") {
             command_template.replace("{}", &escaped)
         } else {
@@ -1074,8 +1118,25 @@ impl App {
             }
             #[cfg(feature = "pdf")]
             Some(OpenPosition::Page(pg)) => {
+                let scroll_mode =
+                    self.settings.load().pdf_render_mode == crate::settings::PdfRenderMode::Scroll;
                 if let Some(ref mut pdf_reader) = self.pdf_reader {
                     pdf_reader.set_page(pg);
+                    // Kitty scroll mode positions the view from this once page
+                    // heights are known, like a bookmarked page. `set_page`
+                    // computed its offset from unknown heights, so start at 0.
+                    if pdf_reader.is_kitty && scroll_mode {
+                        if let Some(zoom) = pdf_reader.zoom.as_mut() {
+                            zoom.global_scroll_offset = 0;
+                        }
+                        pdf_reader.pending_initial_scroll_page = Some(pg);
+                    }
+                }
+                if let Some(ref mut service) = self.pdf_service {
+                    service.set_current_page_no_render(pg);
+                }
+                if let Some(cmd_tx) = self.pdf_conversion_tx.as_ref() {
+                    let _ = cmd_tx.send(crate::pdf::ConversionCommand::NavigateTo(pg));
                 }
             }
             #[cfg(not(feature = "pdf"))]
@@ -1621,6 +1682,12 @@ impl App {
             conversion_rx = Some(render_rx);
         }
 
+        let mut service = service;
+        let mut pdf_reader = pdf_reader;
+        if self.watch_on_open && !crate::pdf::is_djvu_path(&doc_path) {
+            service.enable_watching();
+            pdf_reader.watching = service.is_watching();
+        }
         self.pdf_service = Some(service);
         self.pdf_reader = Some(pdf_reader);
         self.pdf_document_path = Some(doc_path.clone());
@@ -1680,6 +1747,7 @@ impl App {
 
         let black = color_to_i32(palette.base_00); // Background
         let white = color_to_i32(palette.base_05); // Foreground
+        crate::pdf::set_title_color(color_to_i32(palette.base_0d) as u32); // Headings
         (black, white)
     }
 
@@ -1746,6 +1814,7 @@ impl App {
         let Some(plan) = self.pdf_pending_display.take() else {
             return;
         };
+        self.resolve_link_preview_page();
 
         let has_popup = self.has_active_popup();
 
@@ -1759,6 +1828,32 @@ impl App {
             has_popup,
             self.pdf_conversion_tx.as_ref(),
         );
+    }
+
+    /// Hand the link preview its destination page from the render cache,
+    /// requesting the page when it isn't rendered yet (the next frame after
+    /// it arrives picks it up).
+    #[cfg(feature = "pdf")]
+    fn resolve_link_preview_page(&mut self) {
+        let use_shm = self.pdf_kitty_shm_support.unwrap_or(true);
+        let (Some(pdf_reader), Some(service)) =
+            (self.pdf_reader.as_mut(), self.pdf_service.as_mut())
+        else {
+            return;
+        };
+        let Some(preview) = pdf_reader.link_preview.as_mut() else {
+            return;
+        };
+        preview.use_shm = use_shm;
+        if preview.page_data.is_some() {
+            return;
+        }
+        match service.get_cached_page(preview.page) {
+            Some(data) => preview.page_data = Some(data),
+            None => {
+                service.request_page_if_needed(preview.page);
+            }
+        }
     }
 
     #[cfg(feature = "pdf")]
@@ -4748,6 +4843,10 @@ impl App {
         if self.zen_mode != enabled {
             self.toggle_zen_mode();
         }
+    }
+
+    pub fn set_watch_on_open(&mut self, enabled: bool) {
+        self.watch_on_open = enabled;
     }
 
     pub fn set_test_mode(&mut self, enabled: bool) {
@@ -8064,6 +8163,70 @@ impl App {
         self.focused_panel = FocusedPanel::Popup(PopupWindow::CommentsViewer);
     }
 
+    /// --watch for EPUB/HTML: reopen the book when its file changes on disk.
+    /// Reopening saves and restores the reading position like any open.
+    /// Returns true when the book was reloaded.
+    fn reload_book_if_changed(&mut self) -> bool {
+        if !self.watch_on_open || self.book_watch_checked_at.elapsed() < Duration::from_secs(1) {
+            return false;
+        }
+        self.book_watch_checked_at = Instant::now();
+        #[cfg(feature = "pdf")]
+        if self.pdf_reader.is_some() {
+            return false; // PDFs have their own watcher
+        }
+        let Some(path) = self.current_book.as_ref().map(|b| b.file.clone()) else {
+            return false;
+        };
+        let Some(modified) = std::fs::metadata(&path).and_then(|m| m.modified()).ok() else {
+            return false; // being rewritten
+        };
+        match &self.book_watch {
+            Some((seen, mtime)) if *seen == path && *mtime != modified => {}
+            Some((seen, _)) if *seen == path => return false,
+            _ => {
+                self.book_watch = Some((path, modified));
+                return false;
+            }
+        }
+        // let the writer finish
+        if modified.elapsed().map_or(true, |age| age < Duration::from_millis(500)) {
+            return false;
+        }
+        self.book_watch = Some((path.clone(), modified));
+        match self.open_book_for_reading_by_path(&path, None) {
+            Ok(()) => info!("Reloaded {path} after it changed on disk"),
+            Err(e) => warn!("Reloading {path} failed: {e}"),
+        }
+        true
+    }
+
+    /// Apply a theme edited in the config file by another program. Checked
+    /// about once a second; returns true when the theme changed.
+    fn reload_theme_if_config_changed(&mut self) -> bool {
+        if self.config_checked_at.elapsed() < Duration::from_secs(1) {
+            return false;
+        }
+        self.config_checked_at = Instant::now();
+        let modified = crate::settings::config_modified();
+        if modified == self.config_modified {
+            return false;
+        }
+        self.config_modified = modified;
+        if !crate::settings::reload_theme_from_file() {
+            return false;
+        }
+        crate::theme::load_custom_themes();
+        self.text_reader.invalidate_render_cache();
+        self.apply_theme_to_pdf_reader();
+        #[cfg(feature = "pdf")]
+        if let Some(pdf_reader) = self.pdf_reader.as_mut() {
+            pdf_reader.force_redraw();
+        }
+        info!("Theme reloaded from config: {}", current_theme_name());
+        true
+    }
+
     /// Apply current global theme to PDF reader
     #[cfg(feature = "pdf")]
     fn apply_theme_to_pdf_reader(&mut self) {
@@ -8329,6 +8492,14 @@ where
         }
 
         let mut needs_redraw = events_processed > 0;
+
+        if app.reload_theme_if_config_changed() {
+            needs_redraw = true;
+        }
+
+        if app.reload_book_if_changed() {
+            needs_redraw = true;
+        }
 
         if app.pending_force_redraw {
             app.pending_force_redraw = false;
